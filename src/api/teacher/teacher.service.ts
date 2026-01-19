@@ -1,0 +1,238 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  InternalServerErrorException,
+  NotFoundException,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { CreateTeacherDto } from './dto/create-teacher.dto';
+import { UpdateTeacherDto } from './dto/update-teacher.dto';
+import type { TeacherRepository } from 'src/core/repository/teacher.repository';
+import { BaseService } from 'src/infrastructure/base/base-service';
+import { Teacher } from 'src/core/entity/teacher.entity';
+import { InjectRepository } from '@nestjs/typeorm';
+import { CryptoService } from 'src/infrastructure/crypto/crypto.service';
+import Redis from 'ioredis';
+import { ISuccess } from 'src/infrastructure/pagination/successResponse';
+import { successRes } from 'src/infrastructure/response/success.response';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { InjectRedis } from '@nestjs-modules/ioredis';
+import { TeacherFilterDto } from './dto/teacher-filter.dto';
+import { Between, ILike } from 'typeorm';
+
+@Injectable()
+export class TeacherService extends BaseService<
+  CreateTeacherDto,
+  UpdateTeacherDto,
+  Teacher
+> {
+  constructor(
+    @InjectRepository(Teacher) private readonly teacherRepo: TeacherRepository,
+    @InjectRedis() private readonly redis: Redis,
+    private readonly crypto: CryptoService,
+  ) {
+    super(teacherRepo);
+  }
+
+  async createIncompleteGoogleTeacher(data: any) {
+    let teacher = await this.teacherRepo.findOne({
+      where: { email: data.email },
+    });
+
+    if (!teacher) {
+      // Yangi teacher yaratishda nomlarni qo'lda moslaymiz
+      teacher = this.teacherRepo.create({
+        email: data.email,
+        fullName: data.fullName,
+        googleId: data.googleId,
+        imageUrl: data.imageUrl,
+        googleAccessToken: data.accessToken, // <--- To'g'ri mapping
+        googleRefreshToken: data.refreshToken, // <--- To'g'ri mapping
+        isComplete: false,
+        isActive: false,
+      });
+    } else {
+      // Mavjud teacher uchun yangilash qismi sizda deyarli to'g'ri edi
+      teacher.googleAccessToken = data.accessToken;
+      if (data.refreshToken) {
+        teacher.googleRefreshToken = data.refreshToken;
+      }
+      // Agar rasm yoki ism o'zgargan bo'lsa ularni ham yangilab qo'yish mumkin
+      teacher.imageUrl = data.imageUrl;
+      teacher.fullName = data.fullName;
+    }
+
+    return await this.teacherRepo.save(teacher);
+  }
+
+  async findTeacherByPhone(phoneNumber: string) {
+    return await this.teacherRepo.findOne({ where: { phoneNumber } });
+  }
+
+  async validateTeacher(email: string, password: string) {
+    const teacher = await this.teacherRepo.findOne({
+      where: { email },
+    })
+
+    if (!teacher) {
+      throw new UnauthorizedException('Teacher not found')
+    }
+
+    const isMatch = await this.crypto.compare(password, teacher.password);
+
+    if (!isMatch) {
+      throw new UnauthorizedException('Invalid credentials')
+    }
+
+    return teacher
+  }
+
+
+  async saveOtpToRedis(phoneNumber: string, data: any) {
+    const key = `otp:google:${phoneNumber}`;
+    try {
+      await this.redis.set(key, JSON.stringify(data), 'EX', 120);
+    } catch (error) {
+      throw new InternalServerErrorException('Redis-ga saqlashda xatolik');
+    }
+  }
+
+  async getOtpFromRedis(phoneNumber: string) {
+    const key = `otp:google:${phoneNumber}`;
+    const data = await this.redis.get(key);
+    return data ? JSON.parse(data) : null;
+  }
+
+  async deleteOtpFromRedis(phoneNumber: string) {
+    const key = `otp:google:${phoneNumber}`;
+    await this.redis.del(key);
+  }
+
+  async findCompleteGoogleTeacher(email: string) {
+    return await this.teacherRepo.findOne({ where: { email } });
+  }
+
+  async findByEmail(email: string) {
+    return await this.teacherRepo.findOne({ where: { email } });
+  }
+
+  async activateTeacher(email: string, phoneNumber: string, password: string) {
+    // Bazadan barcha ma'lumotlarni, shu jumladan tokenlarni ham olib kelamiz
+    const teacher = await this.teacherRepo.findOne({ where: { email } });
+
+    if (!teacher) throw new NotFoundException('Foydalanuvchi topilmadi');
+
+    const hashedPassword = await this.crypto.encrypt(password);
+
+    // Faqat kerakli maydonlarni yangilaymiz
+    teacher.phoneNumber = phoneNumber;
+    teacher.password = hashedPassword;
+    teacher.isComplete = true;
+    teacher.isActive = false;
+
+    // teacher obyekti ichida tokenlar borligi sababli, save() ularni o'chirib yubormaydi
+    return await this.teacherRepo.save(teacher);
+  }
+
+  async findFilteredTeachers(query: TeacherFilterDto) {
+    const {
+      search, level, minRating, maxRating,
+      sortBy, sortOrder, page, limit
+    } = query;
+
+    const where: any = {};
+
+    // 1. Qidiruv (Full Name yoki Email bo'yicha)
+    if (search) {
+      where.fullName = ILike(`%${search}%`);
+    }
+
+    // 2. Level bo'yicha filtr
+    if (level) {
+      where.level = level;
+    }
+
+    // 3. Rating diapazoni (0 dan 5 gacha)
+    if (minRating !== undefined && maxRating !== undefined) {
+      where.rating = Between(minRating, maxRating);
+    }
+
+
+    const options: any = {
+      where,
+      take: limit,
+      skip: page, // RepositoryPager ichida (page-1)*take qilingani uchun shunchaki sonni beramiz
+      order: {
+        [sortBy || 'fullName']: sortOrder || 'ASC',
+      },
+      select: {
+        id: true,
+        cardNumber: true,
+        description: true,
+        email: true,
+        fullName: true,
+        phoneNumber: true,
+        experience: true,
+        hourPrice: true,
+        isActive: true,
+        imageUrl: true,
+        level: true,
+        portfolioLink: true,
+        rating: true,
+        specification: true,
+      },
+    };
+
+    return this.findAllWithPagination(options);
+  }
+
+
+  async updateTeacher(id: string, dto: UpdateTeacherDto): Promise<ISuccess> {
+    const { phoneNumber, cardNumber } = dto;
+
+    const teacher = await this.teacherRepo.findOne({ where: { id } });
+    if (!teacher) throw new NotFoundException('Teacher not found');
+
+    if (phoneNumber) {
+      const existsPhoneNumber = await this.teacherRepo.findOne({
+        where: { phoneNumber },
+      });
+      if (existsPhoneNumber && existsPhoneNumber.id !== id)
+        throw new ConflictException('Phone number aready exists');
+    }
+
+    if (cardNumber) {
+      const existsCardNumber = await this.teacherRepo.findOne({
+        where: { phoneNumber },
+      });
+      if (existsCardNumber && existsCardNumber.id !== id)
+        throw new ConflictException('Phone number aready exists');
+    }
+
+    const updatedTeacher = await this.teacherRepo.update(id, dto);
+
+    return successRes(updatedTeacher);
+  }
+
+  async changePassword(id: string, dto: ChangePasswordDto): Promise<ISuccess> {
+    const { currentPassword, newPassword } = dto;
+    const teacher = await this.teacherRepo.findOne({ where: { id } });
+    if (!teacher) throw new NotFoundException('Teacher not found');
+
+    const isMatchPassword = await this.crypto.decrypt(
+      currentPassword,
+      teacher.password,
+    );
+    if (!isMatchPassword)
+      throw new BadRequestException('Current password incorrect');
+
+    const hashedPassword = await this.crypto.encrypt(newPassword);
+
+    teacher.password = hashedPassword;
+
+    await this.teacherRepo.update(id, { password: hashedPassword });
+
+    return successRes({ message: 'Password successfully changed!' });
+  }
+}
